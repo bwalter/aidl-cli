@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
+    path::Path,
     path::PathBuf,
 };
 
@@ -85,88 +86,58 @@ fn parse(mut files: SimpleFiles<String, String>, opt: &Opt) -> Result<()> {
     // Display diagnostics
     report(&files, &parse_results, opt)?;
 
-    // Display element names
+    // Display all items
     for (id, res) in &parse_results {
         let item = match res.file.as_ref().map(|f| &f.item) {
             Some(i) => i,
             None => continue,
         };
 
-        let (item_name, item_line) = match item {
-            ast::Item::Interface(i @ ast::Interface { name, .. }) => (
-                format!("interface {}", name),
-                i.symbol_range.start.line_col.0,
-            ),
-            ast::Item::Parcelable(p @ ast::Parcelable { name, .. }) => (
-                format!("parcelable {}", name),
-                p.symbol_range.start.line_col.0,
-            ),
-            ast::Item::Enum(e @ ast::Enum { name, .. }) => {
-                (format!("enum {}", name), e.symbol_range.start.line_col.0)
-            }
-        };
-
         let file_path: PathBuf = files.get(*id)?.name().into();
-        println!(
-            "{} (in {}:{})",
-            item_name,
-            file_path
-                .file_name()
-                .map(|s| s.to_string_lossy())
-                .unwrap_or_else(|| "<invalid file name>".into()),
-            item_line,
-        );
+
+        display_item(item, &file_path);
     }
 
     Ok(())
 }
 
+// Display 1 item
+fn display_item(item: &ast::Item, file_path: &Path) {
+    let (item_name, item_line) = match item {
+        ast::Item::Interface(i @ ast::Interface { name, .. }) => (
+            format!("interface {}", name),
+            i.symbol_range.start.line_col.0,
+        ),
+        ast::Item::Parcelable(p @ ast::Parcelable { name, .. }) => (
+            format!("parcelable {}", name),
+            p.symbol_range.start.line_col.0,
+        ),
+        ast::Item::Enum(e @ ast::Enum { name, .. }) => {
+            (format!("enum {}", name), e.symbol_range.start.line_col.0)
+        }
+    };
+
+    println!(
+        "{} (in {}:{})",
+        item_name,
+        file_path
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_else(|| "<invalid file name>".into()),
+        item_line,
+    );
+}
+// Display all diagnostics with colors
 fn report(
     files: &SimpleFiles<String, String>,
     results: &HashMap<usize, ParseFileResult<usize>>,
     _opt: &Opt,
 ) -> Result<()> {
-    // Flat-map aidl-parser diagnostics to codespan diagnostics
+    // Flat-map all diagnostics
     let errors = results.iter().flat_map(|(id, r)| {
         r.diagnostics
             .iter()
-            .map(|d| {
-                let mut main_label = codespan_reporting::diagnostic::Label::primary(
-                    *id,
-                    d.range.start.offset..d.range.end.offset,
-                );
-                if let Some(ref context_msg) = d.context_message {
-                    main_label = main_label.with_message(context_msg.clone());
-                }
-                let mut labels = Vec::from([main_label]);
-
-                for info in d.related_infos.iter() {
-                    labels.push(
-                        codespan_reporting::diagnostic::Label::secondary(
-                            *id,
-                            info.range.start.offset..info.range.end.offset,
-                        )
-                        .with_message(info.message.clone()),
-                    )
-                }
-
-                let diagnostic = match d.kind {
-                    aidl_parser::diagnostic::DiagnosticKind::Error => {
-                        codespan_reporting::diagnostic::Diagnostic::error()
-                    }
-                    aidl_parser::diagnostic::DiagnosticKind::Warning => {
-                        codespan_reporting::diagnostic::Diagnostic::warning()
-                    }
-                };
-
-                diagnostic
-                    .with_message(&d.message)
-                    .with_labels(labels)
-                    .with_notes(match d.hint.clone() {
-                        Some(h) => Vec::from([h]),
-                        None => Vec::new(),
-                    })
-            })
+            .map(|d| to_codespan_diagnostic(*id, d))
             .collect::<Vec<_>>()
     });
 
@@ -180,4 +151,46 @@ fn report(
     }
 
     Ok(())
+}
+
+// Convert aidl-parser Diagnostic into codespan_reporting Diagnostic
+fn to_codespan_diagnostic(
+    id: usize,
+    d: &aidl_parser::diagnostic::Diagnostic,
+) -> codespan_reporting::diagnostic::Diagnostic<usize> {
+    let mut main_label = codespan_reporting::diagnostic::Label::primary(
+        id,
+        d.range.start.offset..d.range.end.offset,
+    );
+    if let Some(ref context_msg) = d.context_message {
+        main_label = main_label.with_message(context_msg.clone());
+    }
+    let mut labels = Vec::from([main_label]);
+
+    for info in d.related_infos.iter() {
+        labels.push(
+            codespan_reporting::diagnostic::Label::secondary(
+                id,
+                info.range.start.offset..info.range.end.offset,
+            )
+            .with_message(info.message.clone()),
+        )
+    }
+
+    let diagnostic = match d.kind {
+        aidl_parser::diagnostic::DiagnosticKind::Error => {
+            codespan_reporting::diagnostic::Diagnostic::error()
+        }
+        aidl_parser::diagnostic::DiagnosticKind::Warning => {
+            codespan_reporting::diagnostic::Diagnostic::warning()
+        }
+    };
+
+    diagnostic
+        .with_message(&d.message)
+        .with_labels(labels)
+        .with_notes(match d.hint.clone() {
+            Some(h) => Vec::from([h]),
+            None => Vec::new(),
+        })
 }
