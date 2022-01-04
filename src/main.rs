@@ -21,6 +21,22 @@ struct Opt {
     #[structopt(long)]
     pretty: bool,
 
+    /// Do not show diagnostics
+    #[structopt(short = "q", long = "hide-diagnostics")]
+    hide_diagnostics: bool,
+
+    /// Display items
+    #[structopt(short = "i", long = "items")]
+    display_items: bool,
+
+    /// Convert the whole AST to JSON
+    #[structopt(short = "j", long)]
+    to_json: bool,
+
+    /// Output file
+    #[structopt(short = "o", long, parse(from_os_str))]
+    output_path: Option<PathBuf>,
+
     /// The directory where the AIDL files are located
     #[structopt(parse(from_os_str))]
     dir: PathBuf,
@@ -64,7 +80,7 @@ fn parse(mut files: SimpleFiles<String, String>, opt: &Opt) -> Result<()> {
     // Parse all files
     let mut parser = aidl_parser::Parser::new();
     for e in dir_entries {
-        print!(".");
+        eprint!(".");
         std::io::stdout().flush().unwrap();
 
         let mut file = std::fs::File::open(e.path()).unwrap();
@@ -80,22 +96,31 @@ fn parse(mut files: SimpleFiles<String, String>, opt: &Opt) -> Result<()> {
         );
         parser.add_content(id, &buffer);
     }
-    let parse_results = parser.parse();
-    println!();
+    let parse_results = parser.validate();
+    eprintln!();
 
     // Display diagnostics
-    report(&files, &parse_results, opt)?;
+    if !opt.hide_diagnostics {
+        report(&files, &parse_results, opt)?;
+    }
 
     // Display all items
-    for (id, res) in &parse_results {
-        let item = match res.file.as_ref().map(|f| &f.item) {
-            Some(i) => i,
-            None => continue,
-        };
+    if opt.display_items {
+        for (id, res) in &parse_results {
+            let item = match res.ast.as_ref().map(|f| &f.item) {
+                Some(i) => i,
+                None => continue,
+            };
 
-        let file_path: PathBuf = files.get(*id)?.name().into();
+            let file_path: PathBuf = files.get(*id)?.name().into();
 
-        display_item(item, &file_path);
+            display_item(item, &file_path);
+        }
+    }
+
+    // Convert to JSON
+    if opt.to_json {
+        convert_to_json(&files, &parse_results, opt)?;
     }
 
     Ok(())
@@ -193,4 +218,152 @@ fn to_codespan_diagnostic(
             Some(h) => Vec::from([h]),
             None => Vec::new(),
         })
+}
+
+fn convert_to_json(
+    files: &SimpleFiles<String, String>,
+    parse_results: &HashMap<usize, ParseFileResult<usize>>,
+    opt: &Opt,
+) -> Result<()> {
+    #[derive(serde_derive::Serialize)]
+    struct AidlJson<'a> {
+        root: String,
+        items: HashMap<String, AidlJsonItem<'a>>,
+    }
+
+    #[derive(serde_derive::Serialize)]
+    #[serde(transparent)]
+    struct AidlJsonItem<'a> {
+        item: Option<&'a aidl_parser::ast::Item>,
+    }
+
+    let items = parse_results
+        .iter()
+        .map(|(id, res)| {
+            let path = PathBuf::from(files.get(*id).unwrap().name())
+                .to_string_lossy()
+                .to_string();
+            let item = AidlJsonItem {
+                item: res.ast.as_ref().map(|f| &f.item),
+            };
+            (path, item)
+        })
+        .collect();
+
+    let aidl_json = AidlJson {
+        root: std::env::current_dir()?.to_string_lossy().to_string(),
+        items,
+    };
+
+    // Simplify JSON (e.g. remove range info and nested types, map arrays to maps, ...)
+    // TODO: make it possible to keep full info!
+    let json = match map_json_value(serde_json::to_value(&aidl_json)?) {
+        Some(json) => serde_json::to_string_pretty(&json)?,
+        None => return Ok(()),
+    };
+
+    if let Some(path) = opt.output_path.as_ref() {
+        // Write JSON to output file
+        let path = std::fs::canonicalize(path)?;
+        let mut file = std::fs::File::create(&path)?;
+        writeln!(file, "{}\n", json)?;
+    } else {
+        // Write JSON to stdout
+        println!("{}\n", json)
+    };
+
+    Ok(())
+}
+
+fn map_json_value(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Null => Some(value),
+        serde_json::Value::Bool(_) => Some(value),
+        serde_json::Value::Number(_) => Some(value),
+        serde_json::Value::String(_) => Some(value),
+        serde_json::Value::Array(a) => Some(serde_json::Value::Array(
+            a.into_iter().map(map_json_value).flatten().collect(),
+        )),
+        serde_json::Value::Object(o) => Some(serde_json::Value::Object(
+            o.into_iter()
+                .filter_map(|(k, v)| map_json_field(&k, v).map(|v| (k, v)))
+                .map(|(k, v)| map_json_value(v).map(|v| (k, v)))
+                .flatten()
+                .collect(),
+        )),
+    }
+}
+
+fn map_json_field(key: &str, value: serde_json::Value) -> Option<serde_json::Value> {
+    if key.ends_with("_range") {
+        return None;
+    }
+
+    match (key, value) {
+        ("direction", serde_json::Value::Object(o)) => {
+            if o.len() == 1 {
+                let direction_name = o.into_iter().next().unwrap().0;
+                Some(serde_json::Value::String(direction_name))
+            } else {
+                None
+            }
+        }
+        ("parcelable", serde_json::Value::Object(o)) => map_json_parcelable(o),
+        ("interface", serde_json::Value::Object(o)) => map_json_interface(o),
+        ("type" | "return_type", serde_json::Value::Object(o)) => map_json_type(o),
+        (_, value) => Some(value),
+    }
+}
+
+fn map_json_parcelable(
+    mut o: serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Ok(ast_parcelable) =
+        serde_json::from_value::<aidl_parser::ast::Parcelable>(serde_json::Value::Object(o.clone()))
+    {
+        // Deserialize parcelable
+        let new_members: HashMap<String, aidl_parser::ast::Member> = ast_parcelable
+            .members
+            .iter()
+            .map(|el| (el.name.to_owned(), el.clone()))
+            .collect();
+
+        let members = o.get_mut("members")?;
+        *members = serde_json::to_value(&new_members).ok()?;
+    }
+
+    Some(serde_json::Value::Object(o))
+}
+
+fn map_json_interface(
+    mut o: serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Ok(ast_interface) =
+        serde_json::from_value::<aidl_parser::ast::Interface>(serde_json::Value::Object(o.clone()))
+    {
+        // Deserialize interface
+        let new_elements: HashMap<String, aidl_parser::ast::InterfaceElement> = ast_interface
+            .elements
+            .iter()
+            .map(|el| (el.get_name().to_owned(), el.clone()))
+            .collect();
+
+        let elements = o.get_mut("elements")?;
+        *elements = serde_json::to_value(&new_elements).ok()?;
+    }
+
+    Some(serde_json::Value::Object(o))
+}
+
+fn map_json_type(o: serde_json::Map<String, serde_json::Value>) -> Option<serde_json::Value> {
+    if let Ok(ast_type) =
+        serde_json::from_value::<aidl_parser::ast::Type>(serde_json::Value::Object(o.clone()))
+    {
+        // Deserialize type
+        let qualified_name = aidl_parser::symbol::Symbol::Type(&ast_type).get_signature()?;
+        Some(serde_json::Value::String(qualified_name))
+    } else {
+        // Default to given one
+        Some(serde_json::Value::Object(o))
+    }
 }
