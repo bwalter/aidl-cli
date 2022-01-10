@@ -15,9 +15,11 @@ use codespan_reporting::{
 use structopt::StructOpt;
 use walkdir::WalkDir;
 
+mod model;
+
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// Make pretty (but longer) messages
+    /// Make pretty (but longer) output
     #[structopt(long)]
     pretty: bool,
 
@@ -33,6 +35,10 @@ struct Opt {
     #[structopt(short = "j", long)]
     to_json: bool,
 
+    /// Convert the whole AST to YAML
+    #[structopt(short = "y", long)]
+    to_yaml: bool,
+
     /// Output file
     #[structopt(short = "o", long, parse(from_os_str))]
     output_path: Option<PathBuf>,
@@ -45,14 +51,6 @@ struct Opt {
 fn main() -> Result<()> {
     // Command line options
     let opt = Opt::from_args();
-
-    // Tracing
-    let subscriber_builder = tracing_subscriber::fmt().with_thread_names(true);
-    if opt.pretty {
-        subscriber_builder.pretty().init()
-    } else {
-        subscriber_builder.compact().init()
-    }
 
     // Parse files
     let files = SimpleFiles::new();
@@ -119,9 +117,7 @@ fn parse(mut files: SimpleFiles<String, String>, opt: &Opt) -> Result<()> {
     }
 
     // Convert to JSON
-    if opt.to_json {
-        convert_to_json(&files, &parse_results, opt)?;
-    }
+    convert(&files, &parse_results, opt)?;
 
     Ok(())
 }
@@ -220,150 +216,159 @@ fn to_codespan_diagnostic(
         })
 }
 
-fn convert_to_json(
+fn convert(
     files: &SimpleFiles<String, String>,
     parse_results: &HashMap<usize, ParseFileResult<usize>>,
     opt: &Opt,
 ) -> Result<()> {
-    #[derive(serde_derive::Serialize)]
-    struct AidlJson<'a> {
-        root: String,
-        items: HashMap<String, AidlJsonItem<'a>>,
+    enum OutputKind {
+        Json,
+        Yaml,
     }
-
-    #[derive(serde_derive::Serialize)]
-    #[serde(transparent)]
-    struct AidlJsonItem<'a> {
-        item: Option<&'a aidl_parser::ast::Item>,
-    }
+    let output_kind = if opt.to_json {
+        OutputKind::Json
+    } else if opt.to_yaml {
+        OutputKind::Yaml
+    } else {
+        return Ok(());
+    };
 
     let items = parse_results
         .iter()
-        .map(|(id, res)| {
-            let path = PathBuf::from(files.get(*id).unwrap().name())
-                .to_string_lossy()
-                .to_string();
-            let item = AidlJsonItem {
-                item: res.ast.as_ref().map(|f| &f.item),
-            };
-            (path, item)
+        .filter_map(|(id, res)| {
+            res.ast.as_ref().map(|ast| {
+                let path = PathBuf::from(files.get(*id).unwrap().name())
+                    .to_string_lossy()
+                    .to_string();
+                let item = match &ast.item {
+                    ast::Item::Interface(i) => convert_interface(path, i),
+                    ast::Item::Parcelable(p) => convert_parcelable(path, p),
+                    ast::Item::Enum(e) => convert_enum(path, e),
+                };
+                (
+                    format!("{}.{}", ast.package.name, ast.item.get_name()),
+                    item,
+                )
+            })
         })
         .collect();
 
-    let aidl_json = AidlJson {
+    let aidl = model::Aidl {
         root: std::env::current_dir()?.to_string_lossy().to_string(),
         items,
     };
 
-    // Simplify JSON (e.g. remove range info and nested types, map arrays to maps, ...)
-    // TODO: make it possible to keep full info!
-    let json = match map_json_value(serde_json::to_value(&aidl_json)?) {
-        Some(json) => serde_json::to_string_pretty(&json)?,
-        None => return Ok(()),
+    let output = match output_kind {
+        OutputKind::Json => {
+            if opt.pretty {
+                serde_json::to_string_pretty(&aidl)?
+            } else {
+                serde_json::to_string(&aidl)?
+            }
+        }
+        OutputKind::Yaml => serde_yaml::to_string(&aidl)?,
     };
 
     if let Some(path) = opt.output_path.as_ref() {
         // Write JSON to output file
         let path = std::fs::canonicalize(path)?;
         let mut file = std::fs::File::create(&path)?;
-        writeln!(file, "{}\n", json)?;
+        writeln!(file, "{}\n", output)?;
     } else {
         // Write JSON to stdout
-        println!("{}\n", json)
+        println!("{}\n", output)
     };
 
     Ok(())
 }
 
-fn map_json_value(value: serde_json::Value) -> Option<serde_json::Value> {
-    match value {
-        serde_json::Value::Null => Some(value),
-        serde_json::Value::Bool(_) => Some(value),
-        serde_json::Value::Number(_) => Some(value),
-        serde_json::Value::String(_) => Some(value),
-        serde_json::Value::Array(a) => Some(serde_json::Value::Array(
-            a.into_iter().map(map_json_value).flatten().collect(),
-        )),
-        serde_json::Value::Object(o) => Some(serde_json::Value::Object(
-            o.into_iter()
-                .filter_map(|(k, v)| map_json_field(&k, v).map(|v| (k, v)))
-                .map(|(k, v)| map_json_value(v).map(|v| (k, v)))
-                .flatten()
-                .collect(),
-        )),
+fn convert_interface(path: String, i: &ast::Interface) -> model::Item {
+    let elements = i
+        .elements
+        .iter()
+        .map(|el| match el {
+            ast::InterfaceElement::Const(c) => (
+                c.name.clone(),
+                model::Element::Const {
+                    name: c.name.clone(),
+                    const_type: model::ast_type_to_string(&c.const_type),
+                    value: c.value.clone(),
+                },
+            ),
+            ast::InterfaceElement::Method(m) => (
+                m.name.clone(),
+                model::Element::Method {
+                    oneway: m.oneway,
+                    name: m.name.clone(),
+                    return_type: model::ast_type_to_string(&m.return_type),
+                    args: m
+                        .args
+                        .iter()
+                        .map(|a| model::Arg {
+                            direction: model::ast_arg_direction_to_direction(&a.direction),
+                            name: a.name.as_ref().cloned(),
+                            arg_type: model::ast_type_to_string(&a.arg_type),
+                            doc: a.doc.as_ref().cloned(),
+                        })
+                        .collect(),
+                    value: m.value,
+                    doc: m.doc.as_ref().cloned(),
+                },
+            ),
+        })
+        .collect();
+
+    model::Item {
+        path,
+        name: i.name.clone(),
+        item_type: model::ItemType::Interface,
+        elements,
+        doc: i.doc.as_ref().cloned(),
     }
 }
 
-fn map_json_field(key: &str, value: serde_json::Value) -> Option<serde_json::Value> {
-    if key.ends_with("_range") {
-        return None;
-    }
+fn convert_parcelable(path: String, p: &ast::Parcelable) -> model::Item {
+    let elements = p
+        .fields
+        .iter()
+        .map(|f| {
+            let element = model::Element::Field {
+                name: f.name.clone(),
+                field_type: model::ast_type_to_string(&f.field_type),
+                doc: f.doc.as_ref().cloned(),
+            };
+            (f.name.clone(), element)
+        })
+        .collect();
 
-    match (key, value) {
-        ("direction", serde_json::Value::Object(o)) => {
-            if o.len() == 1 {
-                let direction_name = o.into_iter().next().unwrap().0;
-                Some(serde_json::Value::String(direction_name))
-            } else {
-                None
-            }
-        }
-        ("parcelable", serde_json::Value::Object(o)) => map_json_parcelable(o),
-        ("interface", serde_json::Value::Object(o)) => map_json_interface(o),
-        ("type" | "return_type", serde_json::Value::Object(o)) => map_json_type(o),
-        (_, value) => Some(value),
+    model::Item {
+        path,
+        name: p.name.clone(),
+        item_type: model::ItemType::Parcelable,
+        elements,
+        doc: p.doc.as_ref().cloned(),
     }
 }
 
-fn map_json_parcelable(
-    mut o: serde_json::Map<String, serde_json::Value>,
-) -> Option<serde_json::Value> {
-    if let Ok(ast_parcelable) =
-        serde_json::from_value::<aidl_parser::ast::Parcelable>(serde_json::Value::Object(o.clone()))
-    {
-        // Deserialize parcelable
-        let new_members: HashMap<String, aidl_parser::ast::Member> = ast_parcelable
-            .members
-            .iter()
-            .map(|el| (el.name.to_owned(), el.clone()))
-            .collect();
+fn convert_enum(path: String, e: &ast::Enum) -> model::Item {
+    let elements = e
+        .elements
+        .iter()
+        .map(|el| {
+            let element = model::Element::EnumElement {
+                name: el.name.clone(),
+                value: el.value.clone(),
+                doc: el.doc.as_ref().cloned(),
+            };
+            (el.name.clone(), element)
+        })
+        .collect();
 
-        let members = o.get_mut("members")?;
-        *members = serde_json::to_value(&new_members).ok()?;
-    }
-
-    Some(serde_json::Value::Object(o))
-}
-
-fn map_json_interface(
-    mut o: serde_json::Map<String, serde_json::Value>,
-) -> Option<serde_json::Value> {
-    if let Ok(ast_interface) =
-        serde_json::from_value::<aidl_parser::ast::Interface>(serde_json::Value::Object(o.clone()))
-    {
-        // Deserialize interface
-        let new_elements: HashMap<String, aidl_parser::ast::InterfaceElement> = ast_interface
-            .elements
-            .iter()
-            .map(|el| (el.get_name().to_owned(), el.clone()))
-            .collect();
-
-        let elements = o.get_mut("elements")?;
-        *elements = serde_json::to_value(&new_elements).ok()?;
-    }
-
-    Some(serde_json::Value::Object(o))
-}
-
-fn map_json_type(o: serde_json::Map<String, serde_json::Value>) -> Option<serde_json::Value> {
-    if let Ok(ast_type) =
-        serde_json::from_value::<aidl_parser::ast::Type>(serde_json::Value::Object(o.clone()))
-    {
-        // Deserialize type
-        let qualified_name = aidl_parser::symbol::Symbol::Type(&ast_type).get_signature()?;
-        Some(serde_json::Value::String(qualified_name))
-    } else {
-        // Default to given one
-        Some(serde_json::Value::Object(o))
+    model::Item {
+        path,
+        name: e.name.clone(),
+        item_type: model::ItemType::Enum,
+        elements,
+        doc: e.doc.as_ref().cloned(),
     }
 }

@@ -1,16 +1,19 @@
 [package]
 name = "aidl-cli"
 version = "0.1.0"
+authors = ["Benoit Walter <b.walter@meerun.de>"]
+license = "MIT"
 edition = "2021"
+description = "Simple AIDL command line tool"
+repository = "https://github.com/bwalter/aidl-cli"
 
 [dependencies]
-aidl-parser = "0.8"
+aidl-parser = "0.9"
 anyhow = "1.0"
 codespan-reporting = "0.11"
-serde= "1.0"
+serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
+serde_yaml = "0.8"
 structopt = "0.3"
-tracing = "0.1"
-tracing-subscriber = "0.3"
 walkdir = "2.3"
